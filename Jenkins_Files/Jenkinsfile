@@ -1,0 +1,172 @@
+try {
+    node(params.jenkins_node) {
+        def PWD = pwd()
+        echo PWD
+        echo "Will deploy to ${params.username}"
+        echo "Will deploy using inventory ${params.inventory_file}"
+        deleteDir()
+
+        stage('Clone sources') {
+            if (params.environment == "VMWare") {
+                git url: 'http://10.57.37.119/' + params.username + '/cicdimp.git',
+                    branch: params.branch_name
+            }
+            else if (params.environment == "AWS") {
+                git url: 'http://10.15.14.74/' + params.username + '/cicdimp.git',
+                    branch: params.branch_name
+            }
+            else {
+                echo "Environment Settings Error"
+            }
+        }
+        
+        dir("playbooks") {
+
+            stage('Destroy Environment') {
+                if (params.execution == "destroy_env") {
+                    if (params.environment == "VMWare") {
+                        ansiblePlaybook(
+                                playbook: 'destroyEnvironmet.yml',
+                                inventory: params.inventory_file,
+                                extras: '-vvv')
+                    } else if (params.environment == "AWS") {
+                        ansiblePlaybook(
+                                playbook: 'awsDeleteRDS.yml',
+                                inventory: params.inventory_file,
+                                extras: '-vvv')
+                        ansiblePlaybook(
+                                playbook: 'awsDeleteInstance.yml',
+                                inventory: params.inventory_file,
+                                extras: '-vvv')
+                    } else {
+                        echo "Can't find environment"
+                    }
+                } else {
+                    echo "Skipping Destroy Environment stage..."
+                }
+            }
+
+            if (params.environment == "VMWare") {
+                stage('Provision VMWare') {
+                    if (params.execution == "full" || params.execution == "adv:provision_only") {
+                        ansiblePlaybook(
+                                playbook: 'provisioningVMware.yml',
+                                inventory: params.inventory_file,
+                                extras: '-vvv')
+                    } else {
+                        echo "Skipping Provision VMWare stage..."
+                    }
+                }
+            } else if (params.environment == "AWS") {
+                stage('Provision AWS instances') {
+                    if (params.execution == "full" || params.execution == "adv:provision_only") {
+                        ansiblePlaybook(
+                                playbook: 'awsCreateInstance.yml',
+                                inventory: params.inventory_file,
+                                extras: '-vvv')
+                    } else {
+                        echo "Skipping Provision AWS instances stage..."
+                    }
+                }
+            } else {
+                echo "Can't find environment"
+            }
+
+            stage('Host preparation') {
+                if (params.execution == "full" || params.execution == "config_update" || params.execution == "adv:install_components" || params.execution == "adv:oracle_rac_only" || params.execution == "adv:oracle_instance_only" || params.execution == "adv:oracle_db_imp_only") {
+                    ansiblePlaybook(
+                            playbook: 'prep.yml',
+                            inventory: params.inventory_file,
+                            extras: '-vvv')
+                } else {
+                    echo "Skipping Host preparation stage in test mode..."
+                }
+            }
+
+            if (params.environment == "VMWare") {
+                stage('Deploy Oracle RAC') {
+                    if (params.execution == "full" || params.execution == "adv:oracle_rac_only") {
+                        ansiblePlaybook(
+                                playbook: 'orarac.yml',
+                                inventory: params.inventory_file,
+                                extras: '-vvv')
+                    } else {
+                        echo "skipping deploy Oracle Rac and DB instances stage..."
+                    }
+                }
+            }
+
+            stage('Deploy Oracle Instances') {
+                if (params.execution == "full" || params.execution == "adv:oracle_instance_only") {
+                    if (params.environment == "VMWare") {
+                        ansiblePlaybook(
+                                playbook: 'oraracinstance.yml',
+                                inventory: params.inventory_file,
+                                extras: '-vvv')
+                    } else if (params.environment == "AWS") {
+                        ansiblePlaybook(
+                                playbook: 'awsCreateRDS.yml',
+                                inventory: params.inventory_file,
+                                extras: '-vvv')
+                    } else {
+                        echo "Can't find environment"
+                    }
+                } else {
+                    echo "skipping deploy Oracle Rac and DB instances stage..."
+                }
+            }
+
+            if (params.environment == "VMWare") {
+                stage('Import Databases') {
+                    if (params.execution == "full" || params.execution == "adv:oracle_db_imp_only") {
+                        ansiblePlaybook(
+                                playbook: 'oraracdbimport.yml',
+                                inventory: params.inventory_file,
+                                extras: '-vvv')
+                    } else {
+                        echo "skipping deploy Oracle Rac and DB instances stage..."
+                    }
+                }
+            }
+            /*
+             else if (params.environment == "AWS"):
+                Import dmp to RDS
+             */
+
+            stage('Install components') {
+                if (params.execution == "full" || params.execution == "config_update") {
+                    ansiblePlaybook(
+                            playbook: 'install.yml',
+                            inventory: params.inventory_file,
+                            extras: '-vvv')
+                } else if (params.execution == "adv:install_components") {
+                    ansiblePlaybook(
+                            playbook: 'installcompsonly.yml',
+                            inventory: params.inventory_file,
+                            extras: '-vvv')
+                } else {
+                    echo "Skipping Host preparation stage in test mode..."
+                }
+            }
+
+            stage('Run tests') {
+                if (params.execution == "tests" ||
+                        (params.run_tests
+                                && (params.execution == "full"
+                                || params.execution == "config_update"
+                                || params.execution == "adv:install_components"))) {
+                    build job: 'run_jmeter_sanity_tests',
+                            parameters: [[$class: 'StringParameterValue',
+                                          name  : 'inventory_file',
+                                          value : params.inventory_file],
+                                         [$class: 'StringParameterValue',
+                                          name  : 'username',
+                                          value : params.username]]
+                }
+            }
+        }
+    }
+} catch (err) {
+    emailext body: "${err}", subject: "Pipeline Failed", to: params.email_notification
+    throw new RuntimeException('An exception was thrown!')
+}
